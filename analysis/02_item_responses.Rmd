@@ -1,0 +1,498 @@
+---
+title: "Exploring item responses"
+date: "`r Sys.Date()`"
+author: Kristine Zheng
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: paper
+    code_folding: "hide"
+    df_print: paged
+---
+
+## Set up
+```{r}
+rm(list=ls())
+```
+
+```{r setup, include=FALSE, warning=F, message=F}
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load('tidyverse','here','tidyverse', 'mosaic')
+here::i_am("analysis/02_item_responses.Rmd")
+options(digits=5)
+set.seed(12341)
+knitr::opts_chunk$set(
+	fig.width = 6,
+	fig.height = 4,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+## Load data
+
+```{r}
+INPUT_PATH = file.path( '..', 'data', 'college-23') # top-level directory for data
+OUTPUT_PATH = file.path( '..', 'data', 'college-23-processed') # top-level directory for data
+RESPONSES_PATH = file.path(INPUT_PATH, 'raw', 'responses.Rdata')
+CLASSES_PATH = file.path(INPUT_PATH, 'classes.csv')
+
+# TODO: figure out which codebooks are relevant
+CODEBOOK_PAGEVIEWS_PATH = file.path(INPUT_PATH, 'codebooks', 'codebook_page_pageviews.csv') 
+CODEBOOK_PAGE_PATH = file.path(INPUT_PATH, 'codebooks', 'codebook_page.csv')
+CODEBOOK_SURVEYS_PATH = file.path( '..', 'data', 'codebooks', 'survey-codebooks', 'codebook_all_surveys.csv')
+```
+
+```{r}
+# Load raw data from college-23 repository
+# NB: takes 20-30s
+load(file.path(RESPONSES_PATH)) # loads `responses` dataframe
+glimpse(responses)
+```
+
+```{r}
+codebook_classes = read_csv(file.path(CLASSES_PATH)) # matches institutions and classes with textbooks and number of students 
+codebook_pageviews = read_csv(file.path(CODEBOOK_PAGEVIEWS_PATH)) |> select(-1) # codebook for matching chapter and page information, removes non-textbook (survey) pages
+codebook_page = read_csv(file.path(CODEBOOK_PAGE_PATH)) |> select(-1) # details the types and count of items on each page (also a chapter version)
+
+codebook_all_surveys <- read.csv(file.path(CODEBOOK_SURVEYS_PATH))
+
+glimpse(codebook_pageviews)
+```
+
+## Plan
+Overarching goal: gather response level summary analyses and characterize variation between students, classes, chapters, etc 
+
+step 1) aggregate information about attempts, time, etc from the response level to the item level
+- filter out the survey items (merge with codebook_pageviews)
+step 2) distributions
+- items: sorted by easy to hard (proportion correct when attempted) and colored by chapter
+- student level (colored by class/chapter): attempts, proportion completed/attempted, proportion correct, proportion correct when completed, proportion correct when attempted 
+- chapter level: instances of an item
+- class level: proportion completed, chapters accessed 
+
+df:
+- items (separated by student) --> aggregated overall across all students 
+
+## STEP 1: PROCESS DATA
+### 1) Filter responses 
+```{r}
+filtered_responses = responses |>
+  left_join(
+    codebook_pageviews,
+    by = c('release', 'book', 'chapter', 'page')
+  ) |>
+  filter(!is.na(page_num)) |> # remove survey pages and other pages 
+  filter(!(item_id %in% codebook_all_surveys$item_id)) |> 
+  filter(!str_detect(page, "Review Questions")) # eoc quiz questions
+  #filter(str_detect(page, "Review Questions")) # eoc quiz questions
+```
+
+```{r}
+# check which one is unique item identitfier: lrn_activity_reference, lrn_question_reference, item_id
+n_distinct(filtered_responses$item_id) # 840 --> not uniaue but use this because ck uses this
+n_distinct(filtered_responses$lrn_activity_reference) # 843 --> definitely not unique for each question
+n_distinct(filtered_responses$lrn_question_reference) # 910 --> 
+n_distinct(filtered_responses$prompt) # 1172 --> not unique 
+```
+
+TODO: investigate why item_id doesn't match number of questions?
+```{r}
+# check which one is unique item identitfier: lrn_activity_reference, lrn_question_reference, item_id
+filtered_responses |>
+  distinct(item_id, prompt, .keep_all = TRUE) |>
+  select(item_id, prompt) |>
+  nrow() # 1250
+
+filtered_responses |>
+  distinct(item_id, lrn_activity_reference, lrn_question_reference, .keep_all = TRUE) |>
+  select(release, chapter_num, item_id, lrn_activity_reference, lrn_question_reference, prompt) |>
+  View()
+
+filtered_responses |>
+filter(item_id == "Ch2_Starting_1") |>
+  distinct(student_id, item_id, lrn_activity_reference, lrn_question_reference, prompt) |>
+  View()
+```
+
+### 2) Aggregate response attempts to items 
+-> filter out actual content (TODO KRISTINE TO CHECK ON THIS)
+-> use first correct attempt 
+
+```{r}
+items = filtered_responses |>
+  group_by(class_id, student_id, chapter_num, page_num, item_id) |> # group by unique items per student 
+  arrange(attempt) |>
+  drop_na(points_possible, points_earned) |>
+  mutate(
+     correct_first_try = ifelse(attempt == 1, points_earned, NA),
+     is_correct_ever = max(points_earned, na.rm = TRUE), # why is this sometimes Na
+     n_attempts = max(attempt, na.rm = TRUE),
+     dt_submitted_list = list(dt_submitted),
+     first_correct_attempt = ifelse(any(points_earned == points_possible, na.rm = TRUE),  
+                                   min(attempt[points_earned == points_possible], na.rm = TRUE),  
+                                   NA_real_),  # Get first attempt where correct, else NA
+     correctness_over_attempts = is_correct_ever / first_correct_attempt )|>
+  ungroup() |>
+  select(book, release, class_id, student_id, chapter_num, page_num, item_id, item_type,
+         correct_first_try, is_correct_ever, points_possible, first_correct_attempt, n_attempts, correctness_over_attempts, dt_submitted_list, lrn_status) |>
+  distinct() 
+
+#View(items)
+```
+
+save data 
+```{r}
+# Save as .RData
+save(items, file = file.path(OUTPUT_PATH, 'processed_college_23_items.RData'))
+# Save as csv
+write_csv(items, file.path(OUTPUT_PATH, 'processed_college_23_items.csv'))
+
+```
+
+## STEP 2: VISUALIZE
+
+### 0) class variation
+-> chapters accessed per class
+```{r}
+n_distinct(items$class_id) # 48 
+```
+chapters accessed per class
+```{r}
+
+class_chapters <- items |>
+  group_by(class_id) |>
+  arrange(class_id, chapter_num) |>
+  summarise(first_chapter = first(chapter_num), 
+            last_chapter = last(chapter_num),
+            chapters_accessed = n_distinct(chapter_num)
+            ) |> 
+  mutate(
+    class_id = factor(class_id, levels = class_chapters$class_id[order(class_chapters$last_chapter)])
+    )
+
+# Create the plot with lines indicating first and last chapters accessed by each class
+ggplot(class_chapters) +
+  geom_segment(aes(x = first_chapter, xend = last_chapter, y = class_id, yend = class_id), 
+               color = "gray", size = 1) +  # Line connecting first and last chapter
+  geom_point(aes(x = first_chapter, y = class_id), color = "blue", size = 2) +  # First chapter
+  geom_point(aes(x = last_chapter, y = class_id), color = "red", size = 2) +   # Last chapter
+  labs(title = "Textbook Access", 
+       x = "Chapter", 
+       y = "Class") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank()) +
+  scale_x_continuous(breaks = seq(min(class_chapters$first_chapter), 
+                                  max(class_chapters$last_chapter), 
+                                  by = 1))
+
+favstats(class_chapters$chapters_accessed)
+```
+
+
+```{r}
+class_item_completion = items |>
+  group_by(class_id) |>
+  mutate(
+    num_total_attempted = n_distinct(item_id), # multiple item_ids bc everyone does the exercises
+    
+    total_correct = sum(is_correct_ever, na.rm = TRUE), # number of correct items in a chapter
+    num_items = sum(points_possible, na.rm = TRUE), # number of attempted items 
+    prop_correct = total_correct/num_items
+    )|> 
+  ungroup() |> 
+  mutate(class_id = factor(class_id, levels = class_chapters$class_id[order(class_chapters$last_chapter)] ))
+
+ggplot(class_item_completion, aes(y = class_id)) +  # Reverse to match ordering visually
+  geom_segment(aes(x = 0, xend = num_total_attempted, y = class_id, yend = class_id), 
+               color = "gray", size = 1) +  # Line representing range of exercises attempted
+  geom_point(aes(x = num_total_attempted, y = class_id), color = "red", size = 2) +   # Last chapter
+  labs(title = "", 
+       x = "Items Attempted", 
+       y = "Class") +
+  theme_minimal() +
+  theme( axis.text.y = element_blank()) 
+
+# glimpse(class_item_completion)
+# hist(class_item_completion$num_total_attempted)
+
+favstats(class_item_completion$num_total_attempted)
+```
+
+
+### 1) items
+how many items per chapter?
+how many items per student in each chapter 
+how many items did each class do?
+
+### 2) completion/attempts (num responses per item)
+distribution of attempts (generally, per chapter)
+```{r}
+# Create the histogram 
+ggplot(items, aes(x = n_attempts)) + 
+  geom_histogram(binwidth = 1, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "", x = "attempts", y = "frequency") +
+  theme_minimal()
+```
+
+```{r}
+chapter_attempt_summary = items |>
+  group_by(class_id, student_id, chapter_num) |>
+  summarize(
+    total_attempts = sum(n_attempts),
+    num_items = n(),
+    avg_attempt_per_item = total_attempts/ num_items
+  )
+
+# plot distribution of attempts per chapter (scatter, box plot)
+# Scatter plot: distribution of attempts per chapter
+ggplot(chapter_attempt_summary, aes(x = chapter_num, y = avg_attempt_per_item, color = factor(chapter_num))) +
+  geom_point(alpha = 0.3) +
+  labs(title = "", 
+      x = "Chapter", 
+       y = "Avg. attempts per item") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Box plot: distribution of avg. attempts per chapter
+ggplot(chapter_attempt_summary, aes(x = factor(chapter_num), y = avg_attempt_per_item)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", alpha = 0.1) +
+  labs(title = "", 
+       x = "Chapter", 
+       y = "Avg. attempts per item") +
+  theme_minimal()
+```
+sort items by avg. number of attempts, color code by chapter 
+```{r}
+chapter_item_attempt_summary = items |>
+  group_by(chapter_num, page_num, item_id) |> # average over students 
+  summarize(
+    total_attempts = sum(n_attempts, na.rm = TRUE),
+    avg_attempts = mean(n_attempts, na.rm = TRUE)
+  ) 
+
+glimpse(chapter_item_attempt_summary)
+
+# Plot each item as a line, sorted by average attempts and color-coded by chapter
+plot = ggplot(chapter_item_attempt_summary, aes(x = reorder(item_id,total_attempts), 
+                         y = total_attempts, 
+                         group = item_id, 
+                         color = factor(chapter_num))) +
+  geom_segment(aes(xend = item_id, yend = 0), size = 1) +  # Vertical line from 0 to avg_attempts
+  labs(title = "",
+       x = "Item",
+       y = "total Attempts Per Item",
+       color = "Chapter") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot 
+
+# Plot each item as a line, sorted by average attempts and color-coded by chapter
+plot = ggplot(chapter_item_attempt_summary, aes(x = reorder(item_id,avg_attempts), 
+                         y = avg_attempts, 
+                         group = item_id, 
+                         color = factor(chapter_num))) +
+  geom_segment(aes(xend = item_id, yend = 0), size = 1) +  # Vertical line from 0 to avg_attempts
+  labs(title = "",
+       x = "Item",
+       y = "Average Attempts Per Item",
+       color = "Chapter") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot 
+```
+
+- Proportion completed in whole universe (max number for each class)
+- Within class - proportion completed & correct (proportion correct when attempted)
+
+
+### 3) performance (correctness)
+sort items of easy to hard, colored by chapter
+variation by class 
+within class 
+proportion correct out of attempted per class
+
+sort items by avg. number of attempts, color code by chapter 
+```{r}
+correctness_item_summary = items |>
+  group_by(chapter_num, page_num, item_id) |> # average over students 
+  summarize(
+    total_points = sum(is_correct_ever, na.rm = TRUE),
+    avg_points = mean(is_correct_ever, na.rm = TRUE)
+  ) 
+
+glimpse(correctness_item_summary)
+
+# Plot each item as a line, sorted by average attempts and color-coded by chapter
+plot = ggplot(correctness_item_summary, aes(x = reorder(item_id,avg_points), 
+                         y = avg_points, 
+                         group = item_id, 
+                         color = factor(chapter_num))) +
+  geom_segment(aes(xend = item_id, yend = 0), size = 1) +  # Vertical line from 0 to avg_attempts
+  labs(title = "",
+       x = "Item",
+       y = "Average Attempts Per Item",
+       color = "Chapter") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot 
+```
+
+
+```{r}
+chapter_correct_summary = items |>
+  group_by(class_id, student_id, chapter_num) |>
+  summarize(
+    total_correct = sum(is_correct_ever, na.rm = TRUE), # number of correct items in a chapter
+    num_items = n(), # number of attempted items 
+    prop_correct = total_correct/num_items, # proportion correct per chapter 
+  ) |>
+  ungroup() 
+  
+# plot distribution of attempts per chapter (scatter, box plot)
+# Scatter plot: distribution of attempts per chapter
+ggplot(chapter_correct_summary, aes(x = chapter_num, y = prop_correct, color = factor(chapter_num))) +
+  geom_point(alpha = 0.3) +
+  labs(title = "", 
+      x = "Chapter", 
+       y = "prop. correct items") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Box plot: distribution of avg. attempts per chapter
+ggplot(chapter_correct_summary, aes(x = factor(chapter_num), y = prop_correct)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", alpha = 0.1) +
+  labs(title = "", 
+       x = "Chapter", 
+       y = "prop. correct items") +
+  theme_minimal()
+```
+
+sort items by proportion correct, color code by chapter 
+```{r}
+chapter_item_correct_summary = items |>
+  group_by(chapter_num, page_num, item_id) |> # average over students 
+  summarize(
+    total_correct = sum(is_correct_ever, na.rm = TRUE), # number of correct items in a chapter
+    num_items = n(), # number of attempted items 
+    prop_correct = total_correct/num_items, # proportion correct per chapter 
+  ) |>
+  arrange(prop_correct)
+
+glimpse(chapter_item_correct_summary)
+
+# Plot each item as a line, sorted by prop correct and color-coded by chapter
+plot = ggplot(chapter_item_correct_summary, aes(x = reorder(item_id, prop_correct), 
+                         y = prop_correct, 
+                         color = factor(chapter_num))) +
+  geom_segment(aes(x = reorder(item_id, prop_correct), xend = reorder(item_id, prop_correct), y = 0, yend = prop_correct), size = 1) +  
+  labs(title = "",
+       x = "Item",
+       y = "Proportion Correct",
+       color = "Chapter") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot 
+```
+#### scatterplot prop correct v avg attempts
+```{r}
+joined_chapter_summary = chapter_item_attempt_summary |>
+  left_join(chapter_item_correct_summary, join_by("chapter_num","page_num","item_id" ))
+
+plot = ggplot(joined_chapter_summary, aes(x = avg_attempts, 
+                         y = prop_correct, 
+                         color = factor(chapter_num))) +
+  geom_point()+
+    labs(title = "",
+       x = "Avg. Attempts",
+       y = "Proportion Students Correct",
+       color = "Chapter") +
+  theme_minimal() 
+
+plot
+cor(joined_chapter_summary$avg_attempts, joined_chapter_summary$prop_correct, use = "complete.obs")
+
+```
+
+```{r}
+combined_student_chapter_summary = chapter_correct_summary |>
+  left_join(chapter_attempt_summary, join_by("class_id","student_id", "chapter_num", "num_items"))
+
+avg_plot = ggplot(combined_student_chapter_summary, aes(x = avg_attempt_per_item,
+                         y = prop_correct,
+                         color = factor(chapter_num))) +
+  geom_point() +
+    labs(title = "",
+       x = "Avg. Attempts per item",
+       y = "Proportion items Correct",
+       color = "Chapter") +
+  theme_minimal()
+
+avg_plot
+cor(combined_student_chapter_summary$avg_attempt_per_item, combined_student_chapter_summary$prop_correct, use = "complete.obs")
+
+total_plot = ggplot(combined_student_chapter_summary, aes(x = total_attempts, 
+                         y = prop_correct, 
+                         color = factor(chapter_num))) +
+  geom_point() +
+    labs(title = "",
+       x = "Total Attempts",
+       y = "Proportion items Correct",
+       color = "Chapter") +
+  theme_minimal() 
+
+total_plot
+cor(combined_student_chapter_summary$total_attempts, combined_student_chapter_summary$prop_correct, use = "complete.obs")
+
+```
+
+### 4) persistence  
+```{r}
+ggplot(items, aes(x = chapter_num, y = correctness_over_attempts, color = factor(chapter_num))) +
+  geom_point(alpha = 0.3) +
+  labs(title = "", 
+      x = "Chapter", 
+       y = "correctness over attempts") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Box plot: distribution of avg. attempts per chapter
+ggplot(items, aes(x = factor(chapter_num), y = correctness_over_attempts)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", alpha = 0.1) +
+  labs(title = "", 
+       x = "Chapter", 
+       y = "correctness over attempts") +
+  theme_minimal()
+```
+```{r}
+ggplot(items, aes(x = correctness_over_attempts)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "black") +  
+  labs(title = "",
+       x = "Correctness Over Attempts",
+       y = "Count") +
+  theme_minimal()
+```
+if never correct, how many attempts?
+```{r}
+ggplot(items |> filter(is_correct_ever != 1), aes(x = n_attempts)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +  
+  labs(title = "",
+       x = "num attempts when never correct",
+       y = "Count") +
+  theme_minimal()
+
+favstats(~ n_attempts, data = items |> filter(is_correct_ever != 1))
+
+ggplot(items |> filter(is_correct_ever == 1), aes(x = n_attempts)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +  
+  labs(title = "",
+       x = "num attempts when never correct",
+       y = "Count") +
+  theme_minimal()
+favstats(~ n_attempts, data = items |> filter(is_correct_ever == 1))
+```
